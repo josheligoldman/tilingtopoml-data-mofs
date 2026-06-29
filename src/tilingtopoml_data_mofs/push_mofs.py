@@ -30,6 +30,7 @@ import logging
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Iterator
 
 import hydra
 import pandas as pd
@@ -60,6 +61,8 @@ UNIT_CELL_COL = "crystal_unit_cell"
 IS_CLUSTER_VERTEX_COL = "crystal_is_cluster_vertex"
 CLUSTER_ENDPOINTS_COL = "crystal_cluster_endpoints"
 PARQUET_NAME = "train.parquet"   # `data/train.parquet` → HF infers a `train` split
+IN_PROGRESS_PARQUET_NAME = PARQUET_NAME.removesuffix(".parquet") + "-in-progress.parquet"
+WRITE_BUFFER_SIZE = 200          # rows buffered before flushing to disk
 STAGING_ROOT = Path("~/.cache/tilingtopoml-data/hf-upload-staging").expanduser()
 
 
@@ -78,18 +81,41 @@ def _stage_with_symlinks(chemfile_dir: Path, repo_id: str) -> Path:
     return staging
 
 
-def _empty_clustering() -> dict:
-    """Sentinel value for rows with no clustering — empty lists in all four
-    fields. The downstream consumer detects this and falls back to its
-    default clustering path (e.g. CrystalNets for `CrystalTilingComplexes.jl`).
+def _load_in_progress(path: Path) -> set[str]:
+    """Return the set of MOF names already written to the in-progress parquet.
+
+    Reads only the name column so we don't load CIF text or clustering data
+    into memory just to find out what's done.  Returns an empty set when no
+    in-progress file exists.
     """
-    return {
-        ATOM_CLUSTER_COL: [],
-        ATOM_POSITIONS_COL: [],
-        UNIT_CELL_COL: [],
-        IS_CLUSTER_VERTEX_COL: [],
-        CLUSTER_ENDPOINTS_COL: [],
-    }
+    if not path.exists():
+        return set()
+    return set(
+        pd.read_parquet(path, columns=[NAME_COL])[NAME_COL].astype(str)
+    )
+
+
+def _flush_to_disk(new_rows: list[dict], parquet_path: Path) -> int:
+    """Atomically append ``new_rows`` to the in-progress parquet on disk.
+
+    Reads the existing file (if any) fresh from disk each time rather than
+    keeping an in-memory copy, so peak memory is one flush-buffer worth of
+    new rows plus whatever pandas needs to read and write the file.  Writes to
+    a sibling ``.tmp`` file then renames it over ``parquet_path`` — the rename
+    is atomic on POSIX, so the on-disk file is always a valid complete parquet
+    and a crash between flushes leaves the previous flush intact.  Returns the
+    total number of rows now on disk.
+    """
+    new_df = pd.DataFrame(new_rows)
+    if parquet_path.exists():
+        existing_df = pd.read_parquet(parquet_path)
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+    else:
+        combined = new_df
+    tmp = parquet_path.with_suffix(".tmp.parquet")
+    combined.to_parquet(str(tmp), engine="pyarrow", index=False)
+    tmp.rename(parquet_path)
+    return len(combined)
 
 
 def _build_all(
@@ -97,21 +123,13 @@ def _build_all(
     construction_dir: Path,
     cifs_dir: Path,
     num_workers: int,
-    skip_existing: bool,
     rmsd_warn_threshold: float,
-) -> tuple[dict[str, str], dict[str, dict]]:
-    """Run ``_build_one`` for every name; return (status_by_name,
-    clustering_by_name).
+) -> Iterator[tuple[str, str, dict | None]]:
+    """Yield ``(name, status, clustering)`` as each MOF build completes.
 
-    ``status_by_name[name]`` is the per-build status string (``ok``,
-    ``skipped``, ``rmsd_warn:...``, ``failed:...``). ``clustering_by_name``
-    only contains successful builds (skipped builds re-read clustering from
-    the existing CIF — wait, that's not possible; see note below).
-
-    NOTE: when ``skip_existing=True`` and a CIF already exists, we skip the
-    build entirely AND therefore have no clustering for that row. Those rows
-    get empty-list clustering. Pass ``skip_existing=false`` to guarantee
-    clustering for every successfully built MOF.
+    Parse failures are yielded first (before any worker is spawned) so the
+    caller can record them immediately.  The generator does not tally statuses
+    or write ``build_status.csv`` — the caller owns those.
     """
     alias_map = load_alias_map(construction_dir)
     inorganic_order = load_inorganic_node_order(construction_dir)
@@ -119,31 +137,22 @@ def _build_all(
     cifs_dir.mkdir(parents=True, exist_ok=True)
 
     recipes: list[Recipe] = []
-    parse_failures: dict[str, str] = {}
     for name in names:
         try:
             recipes.append(parse_name(str(name)))
         except ValueError as exc:
-            parse_failures[name] = f"failed:parse:{exc}"
+            yield name, f"failed:parse:{exc}", None
 
     payloads = [
         (r, alias_map, inorganic_order, str(bb_dir), str(cifs_dir),
-         skip_existing, rmsd_warn_threshold)
+         rmsd_warn_threshold)
         for r in recipes
     ]
-    log.info(
-        "Building %d MOFs (workers=%d, skip_existing=%s)...",
-        len(payloads), num_workers, skip_existing,
-    )
+    log.info("Building %d MOFs (workers=%d)...", len(payloads), num_workers)
 
-    statuses: dict[str, str] = dict(parse_failures)
-    clusterings: dict[str, dict] = {}
     if num_workers <= 1:
         for p in tqdm(payloads, desc="building USMOF CIFs", unit="MOF"):
-            name, status, clustering = _build_one(p)
-            statuses[name] = status
-            if clustering is not None:
-                clusterings[name] = clustering
+            yield _build_one(p)
     else:
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
             futures = [ex.submit(_build_one, p) for p in payloads]
@@ -151,10 +160,115 @@ def _build_all(
                 as_completed(futures), total=len(futures),
                 desc="building USMOF CIFs", unit="MOF",
             ):
-                name, status, clustering = fut.result()
-                statuses[name] = status
-                if clustering is not None:
-                    clusterings[name] = clustering
+                yield fut.result()
+
+
+@hydra.main(version_base=None, config_path=None, config_name=None)
+def main(cfg: DictConfig) -> None:
+    cifs_dir = Path(cfg.cifs_dir).expanduser()
+    construction_dir = Path(cfg.construction_dir).expanduser()
+    train_csv = Path(cfg.train_csv).expanduser()
+    test_csv = Path(cfg.test_csv).expanduser()
+    chemfile_dir = Path(cfg.chemfile_dir).expanduser()
+    num_workers = int(cfg.get("num_workers", 8))
+    resume = bool(cfg.get("resume", False))
+    rmsd_warn_threshold = float(cfg.get("rmsd_warn_threshold", 0.3))
+
+    train = pd.read_csv(train_csv).rename(columns={SOURCE_NAME_COL: NAME_COL})
+    test = pd.read_csv(test_csv).rename(columns={SOURCE_NAME_COL: NAME_COL})
+    if set(train.columns) != set(test.columns):
+        raise SystemExit(
+            "train/test CSV column sets differ; cannot concatenate. "
+            f"train-only: {set(train.columns) - set(test.columns)} ; "
+            f"test-only: {set(test.columns) - set(train.columns)}"
+        )
+    train = train.assign(**{SPLIT_COL: "train"})
+    test = test.assign(**{SPLIT_COL: "test"})
+    df = pd.concat([train, test], ignore_index=True)
+    log.info(
+        "Loaded %d train + %d test rows (combined %d, %d columns).",
+        len(train), len(test), len(df), len(df.columns),
+    )
+
+    unique_names = df[NAME_COL].astype(str).drop_duplicates().tolist()
+
+    # Precompute name → CSV row indices for O(1) joins as builds complete.
+    name_to_rows: dict[str, list[int]] = {}
+    for i, name in enumerate(df[NAME_COL].astype(str)):
+        name_to_rows.setdefault(name, []).append(i)
+
+    chemfile_dir.mkdir(parents=True, exist_ok=True)
+    in_progress_path = chemfile_dir / IN_PROGRESS_PARQUET_NAME
+
+    # Load existing progress when resuming; ignore it when starting fresh.
+    if resume:
+        done_names = _load_in_progress(in_progress_path)
+        if done_names:
+            log.info(
+                "Resuming: %d / %d names already in %s.",
+                len(done_names), len(unique_names), in_progress_path.name,
+            )
+    else:
+        done_names = set()
+        if in_progress_path.exists():
+            log.warning(
+                "resume=false: ignoring existing %s and rebuilding from scratch.",
+                in_progress_path.name,
+            )
+
+    names_to_build = [n for n in unique_names if n not in done_names]
+    log.info(
+        "Building %d unique MOFs (%d already done).",
+        len(names_to_build), len(done_names),
+    )
+
+    statuses: dict[str, str] = {}
+    buffer: list[dict] = []
+    n_clustering_present = 0
+    n_on_disk = len(done_names)  # rows already written in a previous run
+
+    for name, status, clustering in _build_all(
+        names_to_build, construction_dir, cifs_dir,
+        num_workers=num_workers,
+        rmsd_warn_threshold=rmsd_warn_threshold,
+    ):
+        statuses[name] = status
+        cif_path = cifs_dir / f"{name}.cif"
+        if not cif_path.exists():
+            continue
+        cif_text = cif_path.read_text()
+        # Serialize clustering as JSON strings: Parquet2.jl (the Julia
+        # consumer) cannot read nested parquet columns, so we match the
+        # same wire format used by crystal_chemfile. Empty list = sentinel
+        # for "no clustering; consumer falls back to its default path."
+        if clustering is not None:
+            cluster_cols = {
+                ATOM_CLUSTER_COL:      json.dumps(clustering["atom_cluster"]),
+                ATOM_POSITIONS_COL:    json.dumps(clustering["atom_positions"]),
+                UNIT_CELL_COL:         json.dumps(clustering["unit_cell"]),
+                IS_CLUSTER_VERTEX_COL: json.dumps(clustering["is_cluster_vertex"]),
+                CLUSTER_ENDPOINTS_COL: json.dumps(clustering["cluster_endpoints"]),
+            }
+            n_clustering_present += 1
+        else:
+            cluster_cols = {k: "[]" for k in (
+                ATOM_CLUSTER_COL, ATOM_POSITIONS_COL, UNIT_CELL_COL,
+                IS_CLUSTER_VERTEX_COL, CLUSTER_ENDPOINTS_COL,
+            )}
+        for row_idx in name_to_rows.get(name, []):
+            buffer.append({**df.iloc[row_idx].to_dict(), CIF_COL: cif_text, **cluster_cols})
+
+        if len(buffer) >= WRITE_BUFFER_SIZE:
+            n_on_disk = _flush_to_disk(buffer, in_progress_path)
+            log.info(
+                "Flushed %d rows to %s (total on disk: %d).",
+                len(buffer), in_progress_path.name, n_on_disk,
+            )
+            buffer.clear()
+
+    if buffer:
+        n_on_disk = _flush_to_disk(buffer, in_progress_path)
+        buffer.clear()
 
     tally: dict[str, int] = {}
     for s in statuses.values():
@@ -168,111 +282,28 @@ def _build_all(
     ).to_csv(status_path, index=False)
     log.info("Wrote per-name build status to %s.", status_path)
 
-    return statuses, clusterings
+    if n_on_disk == 0:
+        log.warning("No rows were written; skipping parquet rename.")
+        return
 
-
-@hydra.main(version_base=None, config_path=None, config_name=None)
-def main(cfg: DictConfig) -> None:
-    cifs_dir = Path(cfg.cifs_dir).expanduser()
-    construction_dir = Path(cfg.construction_dir).expanduser()
-    train_csv = Path(cfg.train_csv).expanduser()
-    test_csv = Path(cfg.test_csv).expanduser()
-    chemfile_dir = Path(cfg.chemfile_dir).expanduser()
-    num_workers = int(cfg.get("num_workers", 8))
-    skip_existing = bool(cfg.get("skip_existing", False))
-    rmsd_warn_threshold = float(cfg.get("rmsd_warn_threshold", 0.3))
-
-    train = pd.read_csv(train_csv).rename(columns={SOURCE_NAME_COL: NAME_COL})
-    test = pd.read_csv(test_csv).rename(columns={SOURCE_NAME_COL: NAME_COL})
-    if list(train.columns) != list(test.columns):
-        raise SystemExit(
-            "train/test CSV column lists differ; cannot concatenate. "
-            f"train: {len(train.columns)} cols, test: {len(test.columns)} cols. "
-            f"diff (train-only): {set(train.columns) - set(test.columns)} ; "
-            f"diff (test-only): {set(test.columns) - set(train.columns)}"
-        )
-    train = train.assign(**{SPLIT_COL: "train"})
-    test = test.assign(**{SPLIT_COL: "test"})
-    df = pd.concat([train, test], ignore_index=True)
+    n_dropped = len(df) - n_on_disk
     log.info(
-        "Loaded %d train + %d test rows (combined %d, %d columns).",
-        len(train), len(test), len(df), len(df.columns),
+        "Kept %d / %d CSV rows (dropped %d with no built CIF). "
+        "Clustering present on %d / %d new rows.",
+        n_on_disk, len(df), n_dropped, n_clustering_present, len(names_to_build),
     )
 
-    unique_names = df[NAME_COL].astype(str).drop_duplicates().tolist()
-    log.info("Building %d unique MOFs.", len(unique_names))
-
-    statuses, clusterings = _build_all(
-        unique_names, construction_dir, cifs_dir,
-        num_workers=num_workers,
-        skip_existing=skip_existing,
-        rmsd_warn_threshold=rmsd_warn_threshold,
-    )
-
-    cifs_by_stem: dict[str, Path] = {p.stem: p for p in cifs_dir.glob("*.cif")}
-    log.info("Found %d CIF files in %s after build.", len(cifs_by_stem), cifs_dir)
-
-    matched_rows: list[int] = []
-    cif_texts: list[str] = []
-    atom_clusters: list[list] = []
-    atom_positions: list[list] = []
-    unit_cells: list[list] = []
-    is_cluster_vertex: list[list] = []
-    cluster_endpoints: list[list] = []
-    n_clustering_present = 0
-    for i, name in enumerate(df[NAME_COL].astype(str)):
-        path = cifs_by_stem.get(name)
-        if path is None:
-            continue
-        matched_rows.append(i)
-        cif_texts.append(path.read_text())
-        clustering = clusterings.get(name)
-        if clustering is None:
-            atom_clusters.append([])
-            atom_positions.append([])
-            unit_cells.append([])
-            is_cluster_vertex.append([])
-            cluster_endpoints.append([])
-        else:
-            atom_clusters.append(clustering["atom_cluster"])
-            atom_positions.append(clustering["atom_positions"])
-            unit_cells.append(clustering["unit_cell"])
-            is_cluster_vertex.append(clustering["is_cluster_vertex"])
-            cluster_endpoints.append(clustering["cluster_endpoints"])
-            n_clustering_present += 1
-
-    n_unmatched = len(df) - len(matched_rows)
-    n_orphan = len(cifs_by_stem) - len({df[NAME_COL].astype(str).iloc[i] for i in matched_rows})
-    log.info(
-        "Matched %d / %d CSV rows; dropped %d unmatched rows and %d orphan CIFs. "
-        "Clustering present on %d / %d kept rows.",
-        len(matched_rows), len(df), n_unmatched, n_orphan,
-        n_clustering_present, len(matched_rows),
-    )
-
-    kept_df = df.iloc[matched_rows].reset_index(drop=True).copy()
-    kept_df[CIF_COL] = cif_texts
-    # Serialize the clustering columns as JSON strings rather than nested
-    # list/struct columns: Parquet2.jl (the Julia consumer) cannot read nested
-    # parquet columns. Empty sentinel ([]) serializes to "[]".
-    kept_df[ATOM_CLUSTER_COL] = [json.dumps(x) for x in atom_clusters]
-    kept_df[ATOM_POSITIONS_COL] = [json.dumps(x) for x in atom_positions]
-    kept_df[UNIT_CELL_COL] = [json.dumps(x) for x in unit_cells]
-    kept_df[IS_CLUSTER_VERTEX_COL] = [json.dumps(x) for x in is_cluster_vertex]
-    kept_df[CLUSTER_ENDPOINTS_COL] = [json.dumps(x) for x in cluster_endpoints]
-
-    # Write the parquet directly via pandas/pyarrow rather than routing through
-    # datasets.Dataset.from_pandas(...).to_parquet(). All columns are now simple
-    # types (the clustering columns are JSON strings above), so the HF `datasets`
-    # roundtrip buys nothing — and its multiprocessing parquet writer was
-    # deadlocking after the build (runs hung for >1h with stray worker procs).
-    # pandas.to_parquet is single-process, deterministic, and lower-memory.
-    chemfile_dir.mkdir(parents=True, exist_ok=True)
+    # Rename the in-progress file to the final output name now that the build
+    # is complete. Using to_parquet directly (not datasets.Dataset.from_pandas)
+    # avoids the multiprocessing parquet writer that was deadlocking after the
+    # build (runs hung for >1h with stray worker procs).
     parquet_path = chemfile_dir / PARQUET_NAME
-    log.info("Writing parquet: %d rows, %d columns.", len(kept_df), len(kept_df.columns))
-    kept_df.to_parquet(str(parquet_path), engine="pyarrow", index=False)
-    log.info("Saved local parquet to %s (%.1f MB).",
-             parquet_path, parquet_path.stat().st_size / 1e6)
+    in_progress_path.rename(parquet_path)
+    log.info(
+        "Renamed %s → %s (%.1f MB).",
+        in_progress_path.name, parquet_path.name,
+        parquet_path.stat().st_size / 1e6,
+    )
 
     hf_dataset = cfg.get("hf_dataset")
     if not hf_dataset:

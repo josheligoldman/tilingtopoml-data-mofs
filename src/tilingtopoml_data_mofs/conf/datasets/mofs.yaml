@@ -7,7 +7,7 @@ hf_dataset: ${oc.env:MOF_HF_DATASET,null}           # optional; if set, upload c
 
 # Build knobs (passed to build_usmof_cifs._build_one)
 num_workers: 16
-skip_existing: false                                # default false: re-build everything so every kept row has clustering
+resume: false                                       # set true to skip names already in train-in-progress.parquet
 rmsd_warn_threshold: 0.3
 
 hydra:

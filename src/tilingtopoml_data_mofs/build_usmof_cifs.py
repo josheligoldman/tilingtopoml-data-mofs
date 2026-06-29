@@ -417,11 +417,11 @@ def extract_clustering(framework) -> dict:
 def _build_one(args: tuple) -> tuple[str, str, dict | None]:
     """Worker: build one MOF, return (name, status, clustering).
 
-    Status is one of: ``ok``, ``skipped``, ``skipped:ambiguous_node_assignment``
+    Status is one of: ``ok``, ``skipped:ambiguous_node_assignment``
     (the ~9 two-inorganic, same-CN MOFs we can't reproduce from the deposit —
     see the drop guard below), ``rmsd_warn:<value>``, ``failed:<reason>``.
     ``clustering`` is the dict from :func:`extract_clustering` on success
-    (including ``rmsd_warn``), or ``None`` on failure / skip.
+    (including ``rmsd_warn``), or ``None`` on skip / failure.
     """
     import pormake as pm  # imported per-worker to avoid fork-pickle weirdness
     import pormake.log  # noqa: F401 — importing configures the "unique_logger"
@@ -432,11 +432,9 @@ def _build_one(args: tuple) -> tuple[str, str, dict | None]:
     # noise silently, while still letting genuine ERROR-level messages through.
     logging.getLogger("unique_logger").setLevel(logging.ERROR)
 
-    recipe, alias_map, inorganic_order, bb_dir_str, out_dir_str, skip_existing, rmsd_warn = args
+    recipe, alias_map, inorganic_order, bb_dir_str, out_dir_str, rmsd_warn = args
     bb_dir = Path(bb_dir_str)
     out_path = Path(out_dir_str) / f"{recipe.name}.cif"
-    if skip_existing and out_path.exists():
-        return recipe.name, "skipped", None
     try:
         topo = pm.Database().get_topo(recipe.net)
     except Exception as exc:  # noqa: BLE001
