@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local environment variables (copy .env.template -> .env and fill in)
+.env
+
+/.claude/
+/outputs/
