@@ -1,0 +1,16 @@
+train_csv: ${oc.env:TRAIN_CSV}
+test_csv: ${oc.env:TEST_CSV}
+construction_dir: ${oc.env:CONSTRUCTION_DIR}        # xyz BBs + alias CSVs (Ball 2026 USMOF_construction/)
+chemfile_dir: ${oc.env:CHEMFILE_DIR}                # local parquet output dir (data/train.parquet)
+
+# Build knobs (passed to build_usmof_cifs._build_one)
+num_workers: 20
+resume: true
+rmsd_warn_threshold: 0.3
+
+hydra:
+  run:
+    dir: ${oc.env:LOG_PATH}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${oc.env:LOG_PATH}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
